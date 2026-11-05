@@ -1,0 +1,42 @@
+{
+  "dataset": "FD001",
+  "train_samples": 20631,
+  "test_samples": 100,
+  "feature_count": 150,
+  "rul_rf": {
+    "mae": 13.152828773868924,
+    "rmse": 18.401143237604767,
+    "r2": 0.8039214585450762
+  },
+  "rul_gb": {
+    "mae": 14.146074166831884,
+    "rmse": 19.38485665613913,
+    "r2": 0.7823966166414293
+  },
+  "fail_rf": {
+    "precision": 0.9230769230769231,
+    "recall": 0.96,
+    "f1": 0.9411764705882353,
+    "roc_auc": 0.9925333333333334
+  },
+  "fail_gb": {
+    "precision": 0.8928571428571429,
+    "recall": 1.0,
+    "f1": 0.9433962264150944,
+    "roc_auc": 0.9978666666666667
+  },
+  "production_monitoring": {
+    "rul_below_30": 24,
+    "rul_below_15": 10,
+    "fail_prob_above_07": 26
+  },
+  "lstm": {
+    "mae": 12.1042,
+    "rmse": 15.6203,
+    "r2": 0.8587,
+    "window": 30,
+    "n_features": 14,
+    "rul_cap": 125,
+    "epochs_run": 25
+  }
+}

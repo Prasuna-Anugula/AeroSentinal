@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv
+venv/
+ENV/
+
+# Large ML binary artifacts
+NASATurbofanEnginePredictiveMaintenance/models/*.joblib
+NASATurbofanEnginePredictiveMaintenance/models/*.keras
+NASATurbofanEnginePredictiveMaintenance/models/*.h5
+
+# Frontend build output and dependencies
+AeroSentinel/frontend/node_modules/
+AeroSentinel/frontend/dist/
+AeroSentinel/frontend/.env.local
+
+# SQLite database
+AeroSentinel/storage/
+
+# Dataset raw files (large text files already in repo history elsewhere)
+CMaps/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
