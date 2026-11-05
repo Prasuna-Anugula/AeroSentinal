@@ -77,5 +77,7 @@ def get_engine_explanation(dataset: str, engine_unit: int, model_key: str = "rul
         "dataset":     dataset,
         "model_key":   model_key,
         "prediction":  round(pred, 2),
+        "method":      "local_feature_contribution",
+        "method_note": "Approximation: global importance × |scaled feature value|. Not TreeSHAP.",
         "top_features": items,
     }

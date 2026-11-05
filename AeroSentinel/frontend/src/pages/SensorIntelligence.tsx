@@ -126,7 +126,11 @@ export default function SensorIntelligence({ dataset }: Props) {
 
           {/* Local explanation */}
           <div className="mt-5 pt-4 border-t border-border">
-            <h3 className="font-display font-semibold text-sm text-text-sec uppercase tracking-wide mb-3">Local Engine Explanation</h3>
+            <h3 className="font-display font-semibold text-sm text-text-sec uppercase tracking-wide mb-3">Local Feature Contribution — Engine {engine}</h3>
+            <p className="text-xs text-text-sec/40 font-mono mb-2">
+              Approximation: global importance × |scaled feature value|.
+              This is a local contribution proxy, not TreeSHAP.
+            </p>
             <div className="flex gap-2 mb-3">
               <select value={engine} onChange={e => setEngine(Number(e.target.value))}
                 className="flex-1 bg-white/5 border border-border text-text-pri text-xs font-mono rounded-lg px-2 py-1.5 focus:outline-none focus:border-primary/40">
