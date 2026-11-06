@@ -8,7 +8,7 @@
 
 ## 1. What This Project Does — One Paragraph
 
-AeroSentinel is a full-stack AI-powered predictive maintenance platform that takes raw turbofan engine sensor data and transforms it into actionable maintenance intelligence. It ingests multivariate time-series sensor readings from the NASA C-MAPSS dataset, engineers 150 features per engine, runs them through trained machine learning models (Random Forest, Gradient Boosting, XGBoost, LSTM), and delivers five core outputs through a web dashboard: how many cycles an engine has left before failure (RUL), whether it is at risk of failing within 30 cycles, whether its sensor patterns are anomalous, which sensors are driving predictions, and what maintenance action to take. Everything is connected — from raw `.txt` files to a live React dashboard backed by a FastAPI server and a SQLite database.
+AeroSentinel is a full-stack AI-powered predictive maintenance platform that takes raw turbofan engine sensor data and transforms it into actionable maintenance intelligence. It ingests multivariate time-series sensor readings from the NASA C-MAPSS dataset, engineers 150 features per engine, runs them through trained machine learning models (Random Forest, Gradient Boosting, XGBoost, LSTM), and delivers five core outputs through a web dashboard: how many cycles an engine has left before failure (RUL), whether it is at risk of failing within 30 cycles, whether its sensor patterns are anomalous, which sensors are driving predictions, and what maintenance action to take. Everything is connected — from raw `.txt` files to a live React dashboard backed by a FastAPI server and a SQLite database. 
 
 ---
 
@@ -540,9 +540,556 @@ Each panel contains:
 
 ---
 
-## 9. Five Contributions of This Project
+## 9. System Architecture — Detailed Explanation
 
-1. **RUL Estimation** — Regression models predict remaining engine cycles. Best result: LSTM MAE 12.10 cycles on FD001 test set.
+The system is divided into four distinct layers. Each layer has a single responsibility and communicates with the next through a clean interface.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — DATA LAYER                                           │
+│  NASA C-MAPSS .txt files  →  Raw 26-column sensor readings      │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 2 — ML PIPELINE (Python, offline)                        │
+│  Feature Engineering  →  Model Training  →  Saved Artifacts     │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 3 — BACKEND (FastAPI, port 8000)                         │
+│  Load artifacts  →  Run inference  →  SQLite  →  REST API       │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │  JSON over HTTP
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 4 — FRONTEND (React + Vite, port 5173)                   │
+│  10 pages  →  Charts  →  Forms  →  Reports                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Layer 1 — Data Layer
+
+**What it is:** Seven plain-text files per dataset subset, no header row, whitespace-separated.
+
+**Files:**
+```
+train_FD001.txt   →  100 engines, each run until failure (20,631 rows total)
+test_FD001.txt    →  Same 100 engines, cut off at an unknown point (13,096 rows)
+RUL_FD001.txt     →  100 numbers = how many cycles each test engine had left at cutoff
+```
+
+**Column structure (26 columns):**
+```
+[unit] [cycle] [setting1] [setting2] [setting3] [s1] [s2] ... [s21]
+  ↑       ↑        ↑           ↑          ↑        ↑    ↑          ↑
+Engine  Flight  Altitude   Speed      Throttle  Temp Press     Vibration
+ID      number  setting    setting    setting   readings (21 total)
+```
+
+**Key constraint:** The test file deliberately withholds the failure point. You cannot look at `RUL_FD001.txt` during inference — that is the answer key used only for evaluation after predictions are made.
+
+---
+
+### Layer 2 — ML Pipeline
+
+This layer runs **once offline** to produce trained model files. It is split into three scripts:
+
+#### A. save_models.py — Sklearn models
+
+```
+train_FD001.txt
+      │
+      ▼
+add_rul_target()        RUL = max_cycle_per_engine − current_cycle
+      │
+      ▼
+add_rolling_features()  For each of 21 sensors:
+                          rolling_mean_5, rolling_mean_10   (smoothed trend)
+                          rolling_std_5,  rolling_std_10    (volatility)
+      │
+      ▼
+add_degradation_features() For each sensor:
+                          diff_from_start   (drift since engine was new)
+                          normalized        (value ÷ max_lifecycle)
+      │
+      ▼
+failure_within_30 = (RUL ≤ 30).astype(int)   ← classification target
+      │
+      ▼
+150 features total (26 raw → 150 engineered)
+      │
+      ▼
+StandardScaler.fit(X_train) → saved as scaler_fd001.joblib
+      │
+      ▼
+┌─────────────────────────────────────────────────┐
+│  RandomForestRegressor(100 trees, depth=15)     │ → rul_rf_fd001.joblib
+│  GradientBoostingRegressor(100 trees, depth=5)  │ → rul_gb_fd001.joblib
+│  XGBRegressor(200 trees, lr=0.05, depth=6)      │ → rul_xgb_fd001.joblib
+│  RandomForestClassifier(100 trees, depth=15)    │ → failure_rf_fd001.joblib
+│  GradientBoostingClassifier(100 trees, depth=5) │ → failure_gb_fd001.joblib
+└─────────────────────────────────────────────────┘
+      │
+      ▼
+Evaluate on test set (last cycle per engine, compare to RUL_FD001.txt)
+      │
+      ▼
+feature_cols_fd001.json      (ordered list of 150 feature names)
+model_metrics_fd001.json     (MAE, RMSE, R², F1, AUC for all models)
+```
+
+#### B. train_lstm.py — Deep learning models
+
+Different preprocessing — uses **sequences** not snapshots:
+
+```
+train_FD001.txt
+      │
+      ▼
+Select 14 informative sensors (drop 7 that are constant or near-zero variance)
+      │
+      ▼
+MinMaxScaler.fit(X_train_sensors) → rescale to 0–1 range
+      │
+      ▼
+Cap RUL at 125 cycles (piecewise linear target)
+      │
+      Why cap? Without cap, early-life RUL values are 200–300.
+      Model wastes capacity fitting those extremes.
+      After cap, every engine looks "at most 125 cycles from failure"
+      which makes the learning task easier and more uniform.
+      │
+      ▼
+Sliding window: for every position in every engine's trajectory,
+  take the LAST 30 cycles × 14 sensors → shape (30, 14)
+  label = RUL at the last cycle of the window
+      │
+      17,731 training sequences from 100 engines
+      │
+      ▼
+┌──────────────────────────────────────────────────┐
+│  LSTM architecture                               │
+│  Input:     (30 cycles × 14 sensors)             │
+│  LSTM(128)  return_sequences=True  → (30, 128)   │
+│  Dropout(0.2)                                    │
+│  LSTM(64)   return_sequences=False → (64,)       │
+│  Dropout(0.2)                                    │
+│  Dense(32)  ReLU                  → (32,)        │
+│  Dense(1)                         → scalar RUL   │
+│                                                  │
+│  Total params: 124,737                           │
+│  Loss: MSE  |  Optimizer: Adam(lr=0.001)         │
+│  EarlyStopping(patience=10)                      │
+│  ReduceLROnPlateau(patience=5, factor=0.5)       │
+└──────────────────────────────────────────────────┘
+      │
+      ▼
+GRU uses identical architecture with GRU layers instead of LSTM
+      │
+      ▼
+lstm_fd001.keras
+gru_fd001.keras
+```
+
+**Why LSTM beats Random Forest:**
+Random Forest takes one snapshot — the last cycle's 150 features. It cannot see the *rate of change* across cycles.
+LSTM receives 30 consecutive cycles and learns temporal patterns — a sensor that has been declining steadily over 30 cycles signals more risk than one that just happened to read low once. That temporal context is why LSTM achieves MAE 12.10 vs Random Forest's 13.15.
+
+#### C. Isolation Forest — Anomaly Detection
+
+```
+train_FD001.txt  →  21 raw sensor readings  →  StandardScaler
+      │
+      ▼
+IsolationForest(n_estimators=100, contamination=0.05)
+      │
+      How it works:
+      Builds 100 random decision trees. For each point, counts
+      how many splits are needed to isolate it. Normal points
+      are surrounded by many others — hard to isolate, need many splits.
+      Anomalous points are far from the cluster — isolated quickly.
+      Short path length = low decision_function score = anomalous.
+      │
+      ▼
+decision_function(X) → score per cycle
+  score > −0.10  → Normal
+  score < −0.10  → Unusual
+  score < −0.20  → High Anomaly
+```
+
+---
+
+### Layer 3 — Backend (FastAPI)
+
+**Entry point:** `AeroSentinel/backend/run.py`  
+**Starts:** `uvicorn app.main:app --port 8000`
+
+#### Startup sequence
+
+```
+python run.py
+      │
+      ▼
+init_db()
+  Creates SQLite file at storage/aerosentinel.db
+  Creates 5 tables:
+    Engine                  ← one row per engine+dataset combination
+    Prediction              ← every RUL or failure prediction made
+    Anomaly                 ← every anomaly detection run
+    MaintenanceRecommendation ← generated actions + status
+    ModelMetadata           ← model info
+      │
+      ▼
+ModelRegistry.load()
+  Loads from NASATurbofanEnginePredictiveMaintenance/models/:
+    rul_rf_fd001.joblib     (85 MB — Random Forest with 100 trees)
+    rul_gb_fd001.joblib     (0.5 MB)
+    failure_rf_fd001.joblib (4 MB)
+    failure_gb_fd001.joblib (0.4 MB)
+    scaler_fd001.joblib     (0.004 MB)
+    feature_cols_fd001.json (150 feature names in exact order)
+      │
+      ▼
+Isolation Forest trained on FD001 (or loaded from cache)
+      │
+      ▼
+All 9 API routers registered
+API ready at http://localhost:8000
+Docs at     http://localhost:8000/api/docs
+```
+
+#### Request lifecycle — example: predict RUL for Engine 42
+
+```
+Browser: POST /api/predict/rul
+  body: { "dataset": "FD001", "engine_unit": 42, "model_key": "rul_rf" }
+          │
+          ▼
+predictions.py router receives request
+          │
+          ▼
+prediction_service.run_rul_prediction(db, "FD001", 42, "rul_rf")
+          │
+          ▼
+rul_predictor.predict_single_engine("FD001", 42, "rul_rf")
+          │
+          ▼
+Load test_FD001.txt (cached in memory after first load)
+Filter rows where unit == 42  →  156 rows
+          │
+          ▼
+engineer_features(engine_df):
+  add_rul_target()         → adds RUL column (used only for failure_within_30)
+  add_rolling_features()   → 84 new columns
+  add_degradation_features() → 42 new columns
+  failure_within_30 = (RUL ≤ 30)
+          │
+          ▼
+Take last row only (cycle 156)  →  shape (1, 154)
+Extract only FEAT_COLS columns  →  shape (1, 150)
+          │
+          ▼
+scaler.transform(X)  →  normalised (1, 150)
+          │
+          ▼
+rul_rf.predict(X_scaled)  →  [12.87]
+max(12.87, 0) = 12.87 cycles
+          │
+          ▼
+health_status_from_rul(12.87) = "critical"
+          │
+          ▼
+Save to SQLite:
+  Engine row: unit=42, dataset=FD001, last_cycle=156
+  Prediction row: predicted_rul=12.87, model=rul_rf, health=critical
+          │
+          ▼
+Return JSON:
+  { engine_unit: 42, predicted_rul: 12.87, health_status: "critical",
+    last_cycle: 156, true_rul: 10.0, model: "rul_rf", ... }
+          │
+          ▼
+Browser renders gauge at 12.87 cycles, Critical badge (red)
+```
+
+#### Backend folder structure
+
+```
+backend/
+├── app/
+│   ├── main.py          FastAPI app, CORS, router registration, startup
+│   ├── config.py        Paths to dataset dir, models dir, storage dir
+│   ├── database.py      SQLAlchemy engine + session + Base + init_db()
+│   │
+│   ├── api/             One file per concern (thin routers only)
+│   │   ├── health.py        GET /api/health, /api/system/status
+│   │   ├── dashboard.py     GET /api/dashboard/summary, /fleet
+│   │   ├── predictions.py   POST /api/predict/rul, /failure
+│   │   ├── anomalies.py     POST /api/anomaly/detect
+│   │   ├── explanations.py  GET  /api/explanations/feature-importance
+│   │   ├── maintenance.py   POST /api/maintenance/recommendations
+│   │   ├── datasets.py      GET  /api/datasets/{subset}/engines
+│   │   ├── models.py        GET  /api/models/comparison
+│   │   └── reports.py       GET  /api/reports/engine/csv, /pdf
+│   │
+│   ├── services/        Business logic (called by routers)
+│   │   ├── prediction_service.py   orchestrate RUL + failure inference
+│   │   ├── anomaly_service.py      run Isolation Forest, save to DB
+│   │   ├── explanation_service.py  feature importance + local contribution
+│   │   ├── maintenance_service.py  rule engine + DB persistence
+│   │   ├── data_service.py         dataset loading + caching
+│   │   └── report_service.py       CSV + PDF generation
+│   │
+│   ├── ml/              Pure ML — no HTTP, no DB
+│   │   ├── model_loader.py     ModelRegistry singleton (load once at startup)
+│   │   ├── preprocessing.py    Exact replica of v1.py feature engineering
+│   │   ├── rul_predictor.py    Single engine + all engines inference
+│   │   ├── failure_predictor.py Single engine + all engines classification
+│   │   ├── anomaly_detector.py  Isolation Forest train/load/score
+│   │   └── evaluation.py       Load metrics JSON, sensor correlations
+│   │
+│   ├── models/          SQLAlchemy ORM table definitions
+│   │   └── orm.py
+│   │
+│   └── schemas/         Pydantic request/response contracts
+│       └── schemas.py
+│
+└── run.py               uvicorn entry point
+```
+
+**Key design principle:** Three-layer separation inside the backend.
+- **Routers** only validate requests and call services. No ML code.
+- **Services** orchestrate logic, call ML layer, write to DB.
+- **ML layer** is pure Python functions — no FastAPI, no SQLAlchemy. Testable in isolation.
+
+---
+
+### Layer 4 — Frontend (React + Vite)
+
+**Entry point:** `frontend/src/main.tsx`  
+**Router:** React Router v6 with nested routes under `/app`
+
+#### Component hierarchy
+
+```
+main.tsx
+  └── App.tsx                    BrowserRouter + ToastProvider
+        ├── /                    Landing.tsx  (no layout)
+        └── /app                 AppLayout.tsx
+              ├── Sidebar.tsx    Collapsible nav (10 links)
+              ├── TopBar.tsx     Dataset selector + status bar
+              └── <Outlet>       Routed page component
+                    ├── Overview.tsx
+                    ├── EngineMonitor.tsx
+                    ├── RULPrediction.tsx
+                    ├── FailureRisk.tsx
+                    ├── AnomalyDetection.tsx
+                    ├── SensorIntelligence.tsx
+                    ├── MaintenancePlanner.tsx
+                    ├── DatasetExplorer.tsx
+                    ├── ModelInsights.tsx
+                    └── Settings.tsx
+```
+
+#### How a page talks to the backend
+
+```
+User clicks "PREDICT RUL"
+        │
+        ▼
+RULPrediction.tsx calls predictRUL(dataset, engine, modelKey)
+        │
+        ▼
+src/services/api.ts
+  axios.post('/api/predict/rul', { dataset, engine_unit, model_key })
+        │
+        ▼ (Vite dev server proxies /api → localhost:8000)
+        │
+        ▼
+FastAPI backend processes request
+        │
+        ▼
+Returns JSON
+        │
+        ▼
+React state updated: setResult(r.data)
+        │
+        ▼
+RULGauge component re-renders with new RUL value
+Framer Motion animates the arc fill and number counter
+```
+
+#### Reusable UI components
+
+```
+components/ui/
+  GlassCard.tsx      Dark glass panel with blur + border + hover lift
+  KpiCard.tsx        Metric tile with icon, large number, subtitle
+  StatusBadge.tsx    Coloured pill for Healthy/Warning/Critical etc.
+  LoadingSpinner.tsx Animated ring, used while API calls are pending
+  Toast.tsx          Notification system (success/error/warning/info)
+
+components/layout/
+  Sidebar.tsx        Collapsible nav with Lucide icons, active highlight
+  TopBar.tsx         Dataset dropdown, model status, backend status, clock
+  AppLayout.tsx      Sidebar + TopBar + Outlet wrapper
+```
+
+#### Data flow for the fleet overview (most complex call)
+
+```
+Overview.tsx mounts
+        │
+        ▼
+useEffect → Promise.all([
+  getDashboardSummary("FD001"),   GET /api/dashboard/summary
+  getFleet("FD001")               GET /api/dashboard/fleet
+])
+        │
+        ▼
+Backend: get_fleet_overview("FD001")
+  Checks _fleet_cache["FD001"] — if hit, returns instantly
+  If miss: predict_all_engines + predict_failure_all for 100 engines
+  Caches result → subsequent calls are instant
+        │
+        ▼
+Returns 100 engine objects with predicted_rul + failure_probability
+        │
+        ▼
+React state: setSummary + setFleet
+        │
+        ▼
+Recharts renders:
+  BarChart   (RUL distribution buckets)
+  PieChart   (Fleet health donut)
+KpiCard renders 6 metrics
+GlassCard renders production monitoring numbers
+```
+
+---
+
+### How the three main layers communicate
+
+```
+FRONTEND (React)           BACKEND (FastAPI)          ML LAYER (Python)
+     │                          │                           │
+     │  HTTP POST/GET (JSON)     │                           │
+     │ ─────────────────────▶   │                           │
+     │                          │  Python function call     │
+     │                          │ ─────────────────────▶    │
+     │                          │                           │  Load .joblib
+     │                          │                           │  Engineer features
+     │                          │                           │  Scale + predict
+     │                          │  Return prediction dict   │
+     │                          │ ◀─────────────────────    │
+     │                          │                           │
+     │                          │  Write to SQLite          │
+     │                          │ ─────────────────────▶ DB │
+     │                          │                           │
+     │  JSON response           │                           │
+     │ ◀─────────────────────   │                           │
+     │                          │                           │
+  Update state                  │                           │
+  Re-render gauge               │                           │
+```
+
+---
+
+### Database Schema
+
+SQLite file at `AeroSentinel/storage/aerosentinel.db`
+
+```
+Engine
+  id             INTEGER PK
+  engine_unit    INTEGER          ← e.g. 42
+  dataset_subset TEXT             ← e.g. "FD001"
+  last_cycle     INTEGER          ← cycle number at last observation
+  created_at     DATETIME
+
+Prediction
+  id                  INTEGER PK
+  engine_id           FK → Engine.id
+  predicted_rul       REAL         ← output of RUL model
+  failure_probability REAL         ← output of failure classifier
+  model_name          TEXT         ← "rul_rf", "fail_gb", etc.
+  health_status       TEXT         ← "healthy","warning","high_risk","critical"
+  created_at          DATETIME
+
+Anomaly
+  id                   INTEGER PK
+  engine_id            FK → Engine.id
+  cycle                INTEGER      ← which cycle was scored
+  anomaly_score        REAL         ← Isolation Forest decision_function value
+  severity             TEXT         ← "normal","unusual","high_anomaly"
+  contributing_sensors TEXT         ← JSON list of top sensors
+  created_at           DATETIME
+
+MaintenanceRecommendation
+  id             INTEGER PK
+  engine_id      FK → Engine.id
+  recommendation TEXT         ← full recommendation text
+  priority       TEXT         ← "critical","high","medium","normal"
+  evidence       TEXT         ← JSON: {predicted_rul, failure_prob, anomaly_score}
+  status         TEXT         ← "pending" → "reviewed" → "resolved"
+  created_at     DATETIME
+  updated_at     DATETIME
+
+ModelMetadata
+  id                 INTEGER PK
+  model_name         TEXT UNIQUE
+  model_type         TEXT         ← "regression","classification","anomaly"
+  dataset_subset     TEXT
+  evaluation_metrics TEXT         ← JSON
+  artifact_path      TEXT
+  is_available       INTEGER      ← 0 or 1
+  created_at         DATETIME
+```
+
+**Why SQLite and not PostgreSQL?**
+This is a local research platform. SQLite requires zero infrastructure setup — no server process, no credentials, no configuration. The database is a single file you can open in any SQLite browser. For production deployment at scale, the SQLAlchemy ORM makes switching to PostgreSQL a one-line config change.
+
+---
+
+### Vite Proxy — Why you don't need CORS config during development
+
+In `vite.config.ts`:
+```typescript
+server: {
+  proxy: {
+    '/api':    { target: 'http://localhost:8000', changeOrigin: true },
+    '/static': { target: 'http://localhost:8000', changeOrigin: true },
+  }
+}
+```
+When the React app at port 5173 calls `/api/predict/rul`, Vite intercepts it and forwards it to `localhost:8000/api/predict/rul`. The browser thinks it's talking to the same origin — no CORS issue. The FastAPI backend also has CORS middleware configured for when the frontend is deployed separately.
+
+---
+
+### Feature Engineering — Why 26 → 150 Features
+
+The raw data has 26 columns. The model needs more context to make accurate predictions. Here is why each feature group was added:
+
+| Feature Group | Raw count | Engineered | Why it helps |
+|---------------|-----------|------------|--------------|
+| Raw settings + sensors | 26 | 24 | Baseline readings |
+| Rolling mean (w=5) | — | 21 | Smooths noise, shows short-term trend |
+| Rolling mean (w=10) | — | 21 | Shows medium-term trend |
+| Rolling std (w=5) | — | 21 | Increasing volatility signals degradation |
+| Rolling std (w=10) | — | 21 | Medium-term volatility |
+| Diff from start | — | 21 | Absolute drift — how far has sensor moved from baseline |
+| Normalized | — | 21 | Relative position in engine's lifecycle |
+| **Total** | **26** | **150** | |
+
+`sensor_diff_from_start` is particularly powerful: a sensor reading of 600 means little on its own. But knowing it started at 580 and has drifted +20 while another engine started at 600 and hasn't moved — that tells the model which one is degrading.
+
+---
+
+## 10. Five Contributions of This Project — Regression models predict remaining engine cycles. Best result: LSTM MAE 12.10 cycles on FD001 test set.
 
 2. **Failure Risk Classification** — Binary classifier predicts failure within 30 cycles. Gradient Boosting achieves ROC-AUC 0.998, Recall 1.000 — catches every failing engine.
 
@@ -554,7 +1101,7 @@ Each panel contains:
 
 ---
 
-## 10. What to Demo at Evaluation
+## 11. What to Demo at Evaluation
 
 **Recommended demo flow (10 minutes):**
 
@@ -578,7 +1125,7 @@ Each panel contains:
 
 ---
 
-## 11. Questions You May Be Asked
+## 12. Questions You May Be Asked
 
 **Q: Why only FD001 for model training?**  
 A: FD001 is the standard benchmark — simplest subset (1 condition, 1 fault mode). This makes results comparable to published literature. The application supports browsing all four datasets, but clearly labels that predictions use FD001-trained models on FD002–FD004.
@@ -603,7 +1150,7 @@ A: It builds 100 random decision trees. For each data point, it counts how many 
 
 ---
 
-## 12. File Locations Quick Reference
+## 13. File Locations Quick Reference
 
 ```
 INTERNSHIP PROJECT F/
